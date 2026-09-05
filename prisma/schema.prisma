@@ -1,0 +1,307 @@
+// ============================================================================
+// EVENT REGISTRATION SYSTEM — PRISMA SCHEMA
+// ============================================================================
+// Legend used in comments throughout this file:
+//   [DB]   -> constraint is enforced by PostgreSQL itself (cannot be bypassed
+//             by any application code, migration-safe, survives raw SQL)
+//   [APP]  -> constraint MUST be enforced in the application / service layer
+//             because Prisma's schema language (or Postgres in general)
+//             cannot express it declaratively
+//   [BOTH] -> DB provides a backstop (e.g. an index) but the *decision logic*
+//             still lives in the app layer (e.g. transactions, locking)
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================================
+// ENUMS
+// ============================================================================
+
+// [DB] Postgres native enum type -> impossible to insert a role that isn't
+// one of these two values, even via raw SQL or a bug in application code.
+enum Role {
+  ORGANIZER
+  CHECK_IN_STAFF
+}
+
+// [DB] Postgres native enum type -> the five lifecycle states are a closed
+// set at the database level. The *legality of a transition* between two
+// valid states (e.g. CHECKED_IN -> RESERVED) is NOT expressible as an enum
+// constraint, so that is [APP] logic living in the registration service
+// (see docs/BUSINESS_LOGIC.md — state machine).
+enum RegistrationStatus {
+  RESERVED // seat is being held; must be CONFIRMED before expiresAt or it auto-expires
+  CONFIRMED // attendee has confirmed (e.g. paid / RSVP'd); seat still counts toward capacity
+  CHECKED_IN // attendee physically checked in; terminal-ish state, cannot be cancelled
+  CANCELLED // attendee or staff cancelled a RESERVED or CONFIRMED registration
+  EXPIRED // system auto-expired a RESERVED registration that blew past expiresAt
+}
+
+// [DB] Alerts are an append-only log of trigger/dismiss events per session.
+// "Re-triggering" (docs requirement #4) is modeled by allowing multiple
+// CapacityAlert rows per session over time rather than mutating one row —
+// this keeps a full audit trail of every time a session crossed the
+// capacity threshold, which is useful for organizer reporting.
+enum AlertStatus {
+  ACTIVE // currently unacknowledged — session is at/over the alert threshold
+  DISMISSED // an organizer/staff member acknowledged it
+}
+
+// ============================================================================
+// USERS
+// ============================================================================
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique // [DB] unique index — prevents duplicate accounts even under concurrent signups
+  passwordHash String // [APP] hashing (bcrypt/argon2) happens in the auth layer; DB only ever sees the hash
+  role         Role     @default(CHECK_IN_STAFF) // [DB] restricted to enum values; [APP] decides who is ALLOWED to be created as ORGANIZER
+  isActive     Boolean  @default(true) // [APP] soft-disable instead of deleting, so audit history (timeline actorId) never dangles
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Events this user organizes (only meaningful when role = ORGANIZER, [APP] enforced)
+  organizedEvents Event[] @relation("EventOrganizer")
+
+  // Sessions this user (Check-in Staff) has been assigned to work
+  sessionAssignments SessionAssignment[] @relation("StaffAssignments")
+  assignmentsGranted SessionAssignment[] @relation("AssignedBy")
+
+  // Every timeline row this user personally triggered (null actorId = system/cron)
+  timelineActions RegistrationTimeline[] @relation("TimelineActor")
+
+  // Registrations this user created (organizer manually adding an attendee, or staff reserving on-site)
+  registrationsCreated Registration[] @relation("RegistrationCreatedBy")
+
+  // Capacity alerts this user dismissed
+  dismissedAlerts CapacityAlert[] @relation("AlertDismissedBy")
+
+  @@index([role])
+  @@map("users")
+}
+
+// ============================================================================
+// EVENTS
+// ============================================================================
+
+model Event {
+  id          String   @id @default(cuid())
+  name        String
+  slug        String   @unique // [DB] unique index — used in public registration URLs
+  description String?
+  venueName   String
+  startDate   DateTime
+  endDate     DateTime
+  organizerId String
+  organizer   User     @relation("EventOrganizer", fields: [organizerId], references: [id], onDelete: Restrict)
+  // [DB] onDelete: Restrict — a User row (organizer) cannot be deleted while they still own events.
+  // [APP] decision: we deliberately do NOT cascade-delete a user's events; ownership must be
+  // reassigned first. This protects historical registration/audit data from disappearing.
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  sessions Session[]
+
+  @@index([organizerId])
+  @@map("events")
+}
+
+// ============================================================================
+// SESSIONS (a single talk/workshop/slot within an Event, each with its own capacity)
+// ============================================================================
+
+model Session {
+  id          String   @id @default(cuid())
+  eventId     String
+  event       Event    @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  // [DB] onDelete: Cascade — deleting an Event deletes its Sessions. Chosen because a Session
+  // has no independent existence outside its parent Event (unlike a User's Events above).
+
+  title       String
+  description String?
+  location    String? // room / hall, distinct from the Event's overall venueName
+  startTime   DateTime
+  endTime     DateTime
+  capacity    Int // [APP + DB CHECK via migration] must be > 0; see docs — Prisma schema
+  // language has no native CHECK-constraint keyword, so a raw SQL CHECK (capacity > 0) is
+  // added in the migration file as a DB-level backstop; the app layer also validates on input.
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  assignments SessionAssignment[]
+  registrations Registration[]
+  capacityAlerts CapacityAlert[]
+
+  // [APP] "effective seats taken" = COUNT(registrations WHERE status IN (RESERVED, CONFIRMED, CHECKED_IN))
+  // This is a derived value, intentionally NOT stored as a denormalized column, to avoid drift.
+  // It is computed inside a serializable transaction / SELECT ... FOR UPDATE at write time
+  // (see docs/BUSINESS_LOGIC.md) and via a plain COUNT query at read time.
+
+  @@index([eventId])
+  @@index([startTime, endTime])
+  @@map("sessions")
+}
+
+// ============================================================================
+// SESSION ASSIGNMENTS (RBAC scoping: which Check-in Staff can act on which Session)
+// ============================================================================
+
+model SessionAssignment {
+  id         String   @id @default(cuid())
+  sessionId  String
+  session    Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation("StaffAssignments", fields: [userId], references: [id], onDelete: Cascade)
+  // [DB] onDelete: Cascade on both sides — an assignment is meaningless once either the
+  // session or the staff user is gone; nothing else references SessionAssignment.id.
+
+  assignedById String? // organizer who made the assignment; nullable so seed/system assignments are allowed
+  assignedBy   User?   @relation("AssignedBy", fields: [assignedById], references: [id], onDelete: SetNull)
+
+  assignedAt DateTime @default(now())
+
+  // [DB] A staff member can only be assigned to a given session ONCE — enforced by a
+  // composite unique index, not application-side "check then insert" logic (which would
+  // be race-prone under concurrent assignment requests).
+  @@unique([sessionId, userId])
+  @@index([userId])
+  @@map("session_assignments")
+}
+
+// ============================================================================
+// REGISTRATIONS
+// ============================================================================
+
+model Registration {
+  id             String             @id @default(cuid())
+  sessionId      String
+  session        Session            @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  // [DB] onDelete: Restrict — a Session with any registrations (even cancelled/expired ones)
+  // cannot be hard-deleted, because Registration rows are audit-relevant. [APP] "deleting" a
+  // session in the UI should really be an archive/soft-delete flow, not a DB delete.
+
+  attendeeName  String
+  attendeeEmail String
+  attendeePhone String?
+
+  status     RegistrationStatus @default(RESERVED)
+  // [DB] restricted to the 5 enum values.
+  // [APP] the *state machine* (which transitions are legal from which state) is enforced in
+  // the registration service, e.g.:
+  //   RESERVED   -> CONFIRMED | CANCELLED | EXPIRED
+  //   CONFIRMED  -> CHECKED_IN | CANCELLED
+  //   CHECKED_IN -> (terminal, no transitions out)
+  //   CANCELLED  -> (terminal)
+  //   EXPIRED    -> (terminal)
+  // Any other transition attempt must be rejected with an explicit error
+  // (see docs/BUSINESS_LOGIC.md for the full transition table + error messages).
+
+  reservedAt   DateTime  @default(now())
+  expiresAt    DateTime? // [APP] set to reservedAt + X minutes when status = RESERVED; cleared once CONFIRMED
+  confirmedAt  DateTime?
+  checkedInAt  DateTime?
+  cancelledAt  DateTime?
+  cancelReason String?
+
+  createdById String? // staff/organizer who created it; null = self-service public registration
+  createdBy   User?   @relation("RegistrationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  timeline RegistrationTimeline[]
+
+  // [DB] backstop index — capacity-counting queries filter by (sessionId, status) on every
+  // reservation/cancellation, so this composite index keeps the row-locking transaction fast.
+  // The actual capacity ENFORCEMENT (the <= comparison) is [APP] logic executed inside a
+  // SELECT ... FOR UPDATE / SERIALIZABLE transaction — see docs/BUSINESS_LOGIC.md.
+  @@index([sessionId, status])
+  @@index([attendeeEmail])
+  // [APP] Note: we intentionally do NOT add a hard DB unique(sessionId, attendeeEmail)
+  // constraint, because the same email SHOULD be able to re-register after a prior
+  // registration was CANCELLED or EXPIRED. Preventing duplicate *active* registrations
+  // (RESERVED/CONFIRMED/CHECKED_IN) for the same email+session is therefore an [APP] check
+  // performed inside the same locked transaction as the capacity check. (A Postgres partial
+  // unique index — `CREATE UNIQUE INDEX ... WHERE status IN (...)` — is offered as an
+  // optional extra DB-level backstop in the migration SQL; see docs.)
+  @@map("registrations")
+}
+
+// ============================================================================
+// REGISTRATION TIMELINE — immutable, append-only audit trail
+// ============================================================================
+
+model RegistrationTimeline {
+  id             String              @id @default(cuid())
+  registrationId String
+  registration   Registration        @relation(fields: [registrationId], references: [id], onDelete: Restrict)
+  // [DB] onDelete: Restrict — a Registration can never be deleted while timeline rows point
+  // to it, which in practice means Registrations are never hard-deleted at all (status
+  // transitions to CANCELLED/EXPIRED instead). This is what makes the trail immutable in
+  // practice: there is no code path that deletes a Registration.
+
+  actorId String? // [APP] null = system action (e.g. cron-driven auto-expiry), not a user
+  actor   User?   @relation("TimelineActor", fields: [actorId], references: [id], onDelete: SetNull)
+
+  oldStatus RegistrationStatus?
+  newStatus RegistrationStatus
+
+  note String? // e.g. "Cancelled by staff: duplicate registration", "Auto-expired after 15 minutes"
+
+  timestamp DateTime @default(now())
+
+  // [APP + OPS] There is no `updatedAt` field on this model and no application code path
+  // ever issues an UPDATE or DELETE against this table — rows are only ever INSERTed.
+  // For a true DB-level guarantee (not just "we promise not to"), the migration SQL grants
+  // only INSERT/SELECT (no UPDATE/DELETE) on this table to the application's Postgres role.
+  // See docs/BUSINESS_LOGIC.md "Immutable Audit Trail" section for the exact GRANT/REVOKE
+  // statements.
+
+  @@index([registrationId, timestamp])
+  @@map("registration_timeline")
+}
+
+// ============================================================================
+// CAPACITY ALERTS
+// ============================================================================
+
+model CapacityAlert {
+  id        String @id @default(cuid())
+  sessionId String
+  session   Session @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  status AlertStatus @default(ACTIVE)
+  // [DB] restricted to ACTIVE | DISMISSED.
+  // [APP] "re-trigger" rule: before creating a new ACTIVE alert for a session, the service
+  // checks whether an ACTIVE (undismissed) alert already exists for that session — if so, it
+  // reuses it instead of creating a duplicate. Once dismissed, if the session later crosses
+  // the threshold again, a BRAND NEW row is inserted (never re-activating the dismissed one),
+  // so the table doubles as a full history of every capacity-threshold breach + when/who
+  // dismissed each one.
+
+  currentCount Int // seats occupied (Reserved+Confirmed+CheckedIn) at the moment the alert triggered
+  capacity     Int // session capacity at the moment the alert triggered (captured for historical accuracy even if capacity is edited later)
+
+  triggeredAt DateTime @default(now())
+
+  dismissedAt   DateTime?
+  dismissedById String?
+  dismissedBy   User?     @relation("AlertDismissedBy", fields: [dismissedById], references: [id], onDelete: SetNull)
+
+  @@index([sessionId, status])
+  // [APP] Optional stronger DB backstop (added as raw SQL in the migration, see docs):
+  // a partial unique index `UNIQUE (sessionId) WHERE status = 'ACTIVE'` guarantees at the
+  // DB level that a session can never have more than one ACTIVE alert simultaneously,
+  // even if two concurrent requests both try to trigger one.
+  @@map("capacity_alerts")
+}
