@@ -80,32 +80,6 @@ npx prisma db seed
 npm run dev             # http://localhost:3000/dashboard
 ```
 
-## Deploying to Vercel
-
-1. Create a hosted PostgreSQL database (Neon, Supabase, or another provider)
-  and copy its connection string.
-2. Import this repository into Vercel. Vercel detects the Next.js build
-  automatically; `postinstall` runs `prisma generate`.
-3. Add these Vercel environment variables for Production:
-  `DATABASE_URL`, `AUTH_SECRET` (generate a random 32-byte secret), and
-  `AUTH_URL` set to the deployed URL.
-4. From a machine with the production `DATABASE_URL`, initialize the schema:
-  `npm run db:push`, then apply
-  `prisma/migrations_manual/001_extra_constraints.sql` in the database SQL
-  editor and run `npm run db:seed` if demo data is desired.
-5. Redeploy, then open `/login` and sign in with a seeded account.
-
-Never commit `.env`; configure these values in the hosting provider instead.
-
-The frontend expects a signed-in session (`app/(dashboard)/layout.tsx`
-redirects to `/login` otherwise) — since `/login` has no working form yet
-(see `docs/architecture.md` §4), sign in during local development by
-calling NextAuth's `signIn("credentials", { email, password })` from a
-temporary script, a REPL, or by wiring the placeholder form — the
-Credentials provider itself in `src/lib/auth.ts` is fully functional
-against the seeded users (all seed passwords are `Password123!`, see
-`SUBMISSION.md` for the full account list).
-
 ## Setup
 
 ```bash

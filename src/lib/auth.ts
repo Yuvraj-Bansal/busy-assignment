@@ -69,18 +69,23 @@ const authConfig: NextAuthConfig = {
           return null;
         }
 
-        const user = await prisma.user.findUnique({ where: { email } });
-        if (!user || !user.isActive) return null;
+        // TEMPORARY MOCK DATA FOR TESTING (Remove when DB is connected)
+        const mockUsers = [
+          { id: "1", name: "Aditi Sharma", email: "aditi.organizer@eventreg.dev", password: "Password123!", role: "ORGANIZER" as const },
+          { id: "2", name: "Rohan Mehta", email: "rohan.organizer@eventreg.dev", password: "Password123!", role: "ORGANIZER" as const },
+          { id: "3", name: "Neha Kapoor", email: "neha.staff@eventreg.dev", password: "Password123!", role: "CHECK_IN_STAFF" as const },
+        ];
 
-        const valid = await bcrypt.compare(password, user.passwordHash);
-        if (!valid) return null;
+        const mockUser = mockUsers.find(u => u.email === email);
+        if (!mockUser || mockUser.password !== password) {
+          return null;
+        }
 
-        // Shape returned here becomes `user` in the jwt() callback below.
         return {
-          id: user.id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
+          id: mockUser.id,
+          name: mockUser.name,
+          email: mockUser.email,
+          role: mockUser.role,
         };
       },
     }),

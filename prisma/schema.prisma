@@ -24,8 +24,7 @@ datasource db {
 // ENUMS
 // ============================================================================
 
-// [DB] Postgres native enum type -> impossible to insert a role that isn't
-// one of these two values, even via raw SQL or a bug in application code.
+// [DB] Using Postgres native enum for PG; SQLite will store as TEXT
 enum Role {
   ORGANIZER
   CHECK_IN_STAFF
